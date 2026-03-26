@@ -1,0 +1,97 @@
+name: Figma → Code Sync
+
+on:
+  repository_dispatch:
+    types: [figma_updated]
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Fetch Figma component & generate code
+        env:
+          FIGMA_TOKEN: ${{ secrets.FIGMA_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FILE_KEY: ${{ github.event.client_payload.file_key }}
+          NODE_ID: ${{ github.event.client_payload.node_id }}
+          COMPONENT_NAME: ${{ github.event.client_payload.component_name }}
+        run: |
+          node -e "
+          import('https://esm.sh/node-fetch@3').catch(() => {});
+
+          const fileKey = process.env.FILE_KEY;
+          const nodeId  = process.env.NODE_ID;
+          const name    = process.env.COMPONENT_NAME || 'Component';
+
+          async function main() {
+            // 1. Figma에서 노드 정보 가져오기
+            const figmaRes = await fetch(
+              \`https://api.figma.com/v1/files/\${fileKey}/nodes?ids=\${encodeURIComponent(nodeId)}\`,
+              { headers: { 'X-Figma-Token': process.env.FIGMA_TOKEN } }
+            );
+            const figmaData = await figmaRes.json();
+            const node = figmaData.nodes[nodeId]?.document;
+            if (!node) throw new Error('Figma 노드를 찾을 수 없어요: ' + nodeId);
+
+            // 2. Claude로 코드 생성
+            const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+              method: 'POST',
+              headers: {
+                'x-api-key': process.env.ANTHROPIC_API_KEY,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+              },
+              body: JSON.stringify({
+                model: 'claude-sonnet-4-6',
+                max_tokens: 2000,
+                system: \`You are a frontend engineer.
+          Generate a React + TypeScript component from a Figma node.
+          Rules:
+          - Use CSS Modules (ComponentName.module.css)
+          - Use var(--ds-*) for design tokens where appropriate
+          - Output TWO code blocks only, no explanation
+          - First block: tsx code fenced as \\\`\\\`\\\`tsx
+          - Second block: css code fenced as \\\`\\\`\\\`css
+          - UI shell only, no business logic\`,
+                messages: [{
+                  role: 'user',
+                  content: \`Component name: \${name}\nFigma node:\n\${JSON.stringify(node, null, 2)}\`
+                }],
+              }),
+            });
+            const claudeData = await claudeRes.json();
+            const raw = claudeData.content[0].text;
+
+            // 3. tsx / css 분리
+            const tsxMatch = raw.match(/\`\`\`tsx\n([\s\S]*?)\`\`\`/);
+            const cssMatch = raw.match(/\`\`\`css\n([\s\S]*?)\`\`\`/);
+            if (!tsxMatch) throw new Error('tsx 코드를 찾을 수 없어요');
+
+            const fs = await import('fs');
+            fs.mkdirSync(\`src/components/\${name}\`, { recursive: true });
+            fs.writeFileSync(\`src/components/\${name}/\${name}.tsx\`, tsxMatch[1]);
+            if (cssMatch) fs.writeFileSync(\`src/components/\${name}/\${name}.module.css\`, cssMatch[1]);
+
+            console.log('생성 완료:', name);
+          }
+
+          main().catch(e => { console.error(e); process.exit(1); });
+          " --input-type=module
+
+      - name: Commit generated code
+        run: |
+          git config user.name  "figma-sync-bot"
+          git config user.email "bot@figma-sync"
+          git add src/
+          git diff --cached --quiet || git commit -m "feat: sync ${{ github.event.client_payload.component_name }} from Figma"
+          git push
